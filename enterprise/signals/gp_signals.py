@@ -820,15 +820,33 @@ def MarginalizingTimingModel(name="marginalizing_linear_timing_model", use_svd=F
 
 
 class MarginalizingNmat(object):
-    def __init__(self, Mmat, Nmat=0):
+    def __init__(self, Mmat, Nmat=0, extra_bases=None):
         self.Mmat, self.Nmat = Mmat, Nmat
         self.Mprior = Mmat.shape[1] * np.log(1e40)
 
+        # extra_bases: list of (F, phi_inv_2d, logdet_phi) for absorbed GP signals.
+        # F has shape (ntoas, k_i); phi_inv_2d has shape (k_i, k_i).
+        self._extra_bases = extra_bases or []
+        if self._extra_bases:
+            self._F_all = np.hstack([F for F, _, _ in self._extra_bases])
+            k = sum(F.shape[1] for F, _, _ in self._extra_bases)
+            self._phi_inv_all = np.zeros((k, k))
+            col = 0
+            for F, phi_inv_2d, _ in self._extra_bases:
+                n = F.shape[1]
+                self._phi_inv_all[col : col + n, col : col + n] = phi_inv_2d
+                col += n
+            self._gp_logdet_prior = sum(logdet_phi for _, _, logdet_phi in self._extra_bases)
+
     def __add__(self, other):
         if isinstance(other, MarginalizingNmat):
-            raise ValueError("Cannot combine multiple MarginalizingNmat objects.")
+            # Merge two MarginalizingNmat objects (e.g. timing model + absorbed GP).
+            # np.hstack handles the case where either Mmat has 0 columns.
+            new_M = np.hstack([self.Mmat, other.Mmat])
+            new_extras = self._extra_bases + other._extra_bases
+            return MarginalizingNmat(new_M, self.Nmat + other.Nmat, extra_bases=new_extras)
         elif isinstance(other, np.ndarray) or hasattr(other, "solve"):
-            return MarginalizingNmat(self.Mmat, self.Nmat + other)
+            return MarginalizingNmat(self.Mmat, self.Nmat + other, extra_bases=self._extra_bases)
         elif other == 0:
             return self
         else:
@@ -856,32 +874,186 @@ class MarginalizingNmat(object):
     def MNMMNF(self, T):
         return self.cf(self.MNF(T))
 
-    # we're ignoring logdet = True for two-dimensional cases, but OK
-    def solve(self, right, left_array=None, logdet=False):
+    # Level-2 Woodbury: cached Cholesky of (Phi^{-1} + F^T N_M^{-1} F)
+    @property
+    @functools.lru_cache()
+    def cf_gp(self):
+        F = self._F_all
+        FNF = self._solve_NM(F, left_array=F)
+        Sigma = self._phi_inv_all + FNF
+        return cholesky(sps.csc_matrix(Sigma))
+
+    @signal_base.simplememobyid
+    def FNr(self, res):
+        return self._solve_NM(res, left_array=self._F_all)
+
+    @signal_base.simplememobyid
+    def FNT(self, T):
+        return self._solve_NM(T, left_array=self._F_all)
+
+    @signal_base.simplememobyid
+    def cf_gp_FNT(self, T):
+        return self.cf_gp(self.FNT(T))
+
+    # Level-1 solve: timing-model Woodbury only (used by cf_gp and level-2 solve)
+    def _solve_NM(self, right, left_array=None, logdet=False):
+        if self.Mmat.shape[1] == 0:
+            # No timing model — delegate directly to Nmat
+            return self.Nmat.solve(right, left_array=left_array, logdet=logdet)
+
         if right.ndim == 1 and left_array is right:
             res = right
-
             rNr, logdet_N = self.Nmat.solve(res, left_array=res, logdet=True)
-
             MNr = self.MNr(res)
             ret = rNr - np.dot(MNr, self.cf(MNr))
             return (ret, logdet_N + self.cf.logdet() + self.Mprior) if logdet else ret
         elif right.ndim == 1 and left_array is not None and left_array.ndim == 2:
             res, T = right, left_array
-
             TNr = self.Nmat.solve(res, left_array=T)
             return TNr - np.tensordot(self.MNMMNF(T), self.MNr(res), (0, 0))
         elif right.ndim == 2 and left_array is right:
             T = right
-
             TNT = self.Nmat.solve(T, left_array=T)
             return TNT - np.tensordot(self.MNF(T), self.MNMMNF(T), (0, 0))
         elif left_array is not None and right.ndim == left_array.ndim and right.ndim <= 2:
             T = right
             L = left_array
-
             LNT = self.Nmat.solve(T, left_array=L)
-
             return LNT - np.tensordot(self.MNF(L), self.MNMMNF(T), (0, 0))
         else:
+            raise ValueError("Incorrect arguments given to MarginalizingNmat._solve_NM.")
+
+    # we're ignoring logdet = True for two-dimensional cases, but OK
+    def solve(self, right, left_array=None, logdet=False):
+        if not self._extra_bases:
+            return self._solve_NM(right, left_array=left_array, logdet=logdet)
+
+        # Level-2 Woodbury correction: subtract N_M^{-1} F (Phi^{-1} + F^T N_M^{-1} F)^{-1} F^T N_M^{-1}
+        if right.ndim == 1 and left_array is right:
+            res = right
+            ret_NM, logdet_NM = self._solve_NM(res, left_array=res, logdet=True)
+            FNr = self.FNr(res)
+            ret = ret_NM - np.dot(FNr, self.cf_gp(FNr))
+            logdet_total = logdet_NM + self._gp_logdet_prior + self.cf_gp.logdet()
+            return (ret, logdet_total) if logdet else ret
+        elif right.ndim == 1 and left_array is not None and left_array.ndim == 2:
+            res, T = right, left_array
+            TNr = self._solve_NM(res, left_array=T)
+            return TNr - np.tensordot(self.cf_gp_FNT(T), self.FNr(res), (0, 0))
+        elif right.ndim == 2 and left_array is right:
+            T = right
+            TNT = self._solve_NM(T, left_array=T)
+            return TNT - np.tensordot(self.FNT(T), self.cf_gp_FNT(T), (0, 0))
+        elif left_array is not None and right.ndim == left_array.ndim and right.ndim <= 2:
+            T = right
+            L = left_array
+            LNT = self._solve_NM(T, left_array=L)
+            return LNT - np.tensordot(self.FNT(L), self.cf_gp_FNT(T), (0, 0))
+        else:
             raise ValueError("Incorrect arguments given to MarginalizingNmat.solve.")
+
+
+def MarginalizingGP(
+    priorFunction,
+    basisFunction,
+    combine=True,
+    selection=Selection(selections.no_selection),
+    name="",
+):
+    """Class factory for GP signals that are absorbed into the MarginalizingNmat
+    inversion rather than handled via the standard T/phi likelihood path.
+    For best performance, use this version only when holding all GP hyperpparameters fixed. 
+
+    The basis and prior are constructed identically to BasisGP. 
+    The resulting tuple is stored in MarginalizingNmat so the GP is computed and
+    cached as a part of the D-matrix Woodbury inversion.
+
+    .. note::
+        Selections are not yet supported.  Using a selection other than the
+        default will raise an error.
+    """
+
+    BaseClass = BasisGP(priorFunction, basisFunction, coefficients=False, combine=combine, selection=selection, name=name)
+
+    class MarginalizingGP(BaseClass):
+        signal_type = "white noise"
+        signal_name = name
+        signal_id = name
+
+        def __init__(self, psr):
+            super(MarginalizingGP, self).__init__(psr)
+            if len(self._keys) > 1 or self._keys != [""]:
+                raise NotImplementedError(
+                    "MarginalizingGP does not yet support selections. "
+                    "Use selection=Selection(selections.no_selection)."
+                )
+            self._ntoas = len(psr.toas)
+
+        @property
+        def ndiag_params(self):
+            # Empty when the GP has no varying parameters → cached forever.
+            # For GPs with varying basis or prior params, cache invalidates correctly.
+            return self.basis_params + [
+                pp.name for pp in self.params if pp.name not in self.basis_params
+            ]
+
+        @signal_base.cache_call("ndiag_params")
+        def get_ndiag(self, params):
+            self._construct_basis(params)
+            # Build combined Phi across keys (same slice logic as BasisGP.get_phi)
+            phi = KernelMatrix(self._basis.shape[1])
+            for key, slc in self._slices.items():
+                phislc = self._prior[key](self._labels[key], params=params)
+                phi = phi.set(phislc, slc)
+            phi_inv, logdet_phi = phi.inv(logdet=True)
+            # Assemble phi_inv as 2D for MarginalizingNmat (handles diagonal and full Phi)
+            phi_inv_2d = np.diag(phi_inv) if phi_inv.ndim == 1 else phi_inv
+            return MarginalizingNmat(
+                np.zeros((self._ntoas, 0)), 0, extra_bases=[(self._basis, phi_inv_2d, logdet_phi)]
+            )
+
+        # Excluded from standard T/phi aggregation in SignalCollection
+        def get_basis(self, params={}):
+            return None
+
+        def get_phi(self, params):
+            return None
+
+        def get_phiinv(self, params):
+            return None
+
+    return MarginalizingGP
+
+
+def MarginalizingFourierGP(
+    spectrum,
+    combine=True,
+    components=20,
+    selection=Selection(selections.no_selection),
+    Tspan=None,
+    logf=False,
+    fmin=None,
+    fmax=None,
+    modes=None,
+    name="marginalizing_red_noise",
+    pshift=False,
+    pseed=None,
+):
+    """Convenience wrapper returning a MarginalizingGP with a
+    Fourier basis.  Parameters are identical to FourierBasisGP.
+
+    The GP is absorbed into the MarginalizingNmat inversion and cached for
+    the lifetime of the analysis (assuming fixed spectral parameters).
+    """
+
+    basis = utils.createfourierdesignmatrix_red(
+        nmodes=components, Tspan=Tspan, logf=logf, fmin=fmin, fmax=fmax, modes=modes, pshift=pshift, pseed=pseed
+    )
+    BaseClass = MarginalizingGP(spectrum, basis, combine=combine, selection=selection, name=name)
+
+    class MarginalizingFourierGP(BaseClass):
+        signal_type = "white noise"
+        signal_name = "red noise"
+        signal_id = name
+
+    return MarginalizingFourierGP
